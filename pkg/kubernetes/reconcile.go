@@ -1,6 +1,8 @@
 package kubernetes
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -9,6 +11,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/objx"
 	funk "github.com/thoas/go-funk"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/kubernetes/scheme"
 
 	"github.com/grafana/tanka/pkg/kubernetes/manifest"
 	"github.com/grafana/tanka/pkg/spec/v1alpha1"
@@ -29,11 +34,42 @@ func Reconcile(raw map[string]interface{}, spec v1alpha1.Spec, targets []*regexp
 
 	out := make(manifest.List, 0, len(extracted))
 	for _, m := range extracted {
-		if spec.Namespace != "" && !m.Metadata().HasNamespace() {
-			m.Metadata()["namespace"] = spec.Namespace
-		}
+		decode := scheme.Codecs.UniversalDeserializer().Decode
+		// decode to internal type
+		obj, _, err := decode([]byte(m.String()), nil, nil)
+		if err != nil {
+			// If the type is not known in the scheme, it tries to decode it as unstructured.Unstructured{}
+			unstructuredObj := &unstructured.Unstructured{}
+			manifestBytes := []byte(m.String())
+			decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewBuffer(manifestBytes), len(manifestBytes))
+			if err = decoder.Decode(unstructuredObj); err != nil {
+				return nil, err
+			}
+			data, err := json.Marshal(unstructuredObj)
+			unstr := make(map[string]interface{})
+			err = json.Unmarshal(data, &unstr)
+			if err != nil {
+				return nil, errors.Wrap(err, "unmarshal unstructured")
+			}
+			m, err = manifest.NewFromObj(unstr)
+			if err != nil {
+				return nil, errors.Wrap(err, "manifest create unstructured object")
+			}
+			out = append(out, m)
+		} else {
+			data, err := json.Marshal(obj)
+			unstr := make(map[string]interface{})
+			err = json.Unmarshal(data, &unstr)
+			if err != nil {
+				return nil, errors.Wrap(err, "unmarshal structured")
 
-		out = append(out, m)
+			}
+			m, err = manifest.NewFromObj(unstr)
+			if err != nil {
+				return nil, errors.Wrap(err, "manifest create structured object")
+			}
+			out = append(out, m)
+		}
 	}
 
 	// If we have any kind-name matchers, we should filter all the manifests by matching
